@@ -417,6 +417,8 @@
             "gemini-2.5-flash-lite"
         ];
 
+        const toArr = (v) => Array.isArray(v) ? v : (v && typeof v === "object" ? Object.values(v) : []);
+
         const seansMetni = (s) => {
             if (!s) return "";
             const ek = (s.extraNotes || []).map(n => "[Ek not " + (n.date || "") + " " + (n.time || "") + "] " + n.text).join("\n");
@@ -788,6 +790,145 @@
                 if (f.storagePath && window.fbStorage && window.fbDeleteObject) { try { await window.fbDeleteObject(window.fbStorageRef(window.fbStorage, f.storagePath)); } catch (e) { console.warn("Storage silme hatası:", e); } }
                 updateSession(openSessionId, x => ({ ...x, files: (x.files || []).filter(y => y.id !== f.id) }));
             };
+            // ── VERİLER: KARTLAR VE KAYITLAR ──
+            const [activeDataCard, setActiveDataCard] = useState(null);
+            const [dataCards, setDataCards] = useState([]);
+            const [dataSysRecords, setDataSysRecords] = useState({});
+            const [cardModal, setCardModal] = useState(null);
+            const [recModal, setRecModal] = useState(null);
+            const [recSearch, setRecSearch] = useState("");
+            const [recUploading, setRecUploading] = useState(false);
+            const SYS_CARD_META = {
+                aep: { name: "Aile Eğitim Programı", icon: "👨‍👩‍👧‍👦", color: C.teal, kind: "training" },
+                eoe: { name: "Evlilik Öncesi Eğitim", icon: "💍", color: C.accent, kind: "training" },
+                modular: { name: "Modüler AEP", icon: "🧩", color: C.rose, kind: "training" },
+                danismanlik: { name: "Danışmanlık Sayısı", icon: "📈", color: C.violet, kind: "counter" }
+            };
+            const FIELD_TYPES = [["text", "Metin"], ["number", "Sayı"], ["date", "Tarih"], ["tel", "Telefon"], ["longtext", "Uzun metin"]];
+            const FIELD_TEMPLATES = {
+                training: [{ key: "ad", label: "Eğitim Adı", type: "text" }, { key: "kisi", label: "Kişi Sayısı", type: "number" }, { key: "tarih", label: "Tarih", type: "date" }, { key: "not", label: "Not", type: "longtext" }],
+                person: [{ key: "ad", label: "Ad", type: "text" }, { key: "soyad", label: "Soyad", type: "text" }, { key: "durum", label: "Dosyanın Son Durumu", type: "text" }, { key: "telefon", label: "Telefon", type: "tel" }, { key: "adres", label: "Adres", type: "longtext" }, { key: "gorus", label: "Genel Görüş", type: "longtext" }]
+            };
+            const CARD_COLORS = [C.teal, C.accent, C.violet, C.rose, "#f59e0b", "#22c55e"];
+            const CARD_ICONS = ["📋", "🏫", "👨‍👩‍👧", "🧾", "🏠", "⚖️", "🤝", "📞", "📚", "🗂️", "🚨", "🌱"];
+            const newFieldKey = () => "f" + Date.now().toString(36) + Math.floor(Math.random() * 1000);
+            const toInt = (v) => parseInt(v, 10) || 0;
+            const fmtVal = (f, v) => { if (!v) return ""; if (f.type === "date" && /^\d{4}-\d{2}-\d{2}$/.test(v)) return v.split("-").reverse().join("."); return v; };
+            const getCardMeta = (key) => {
+                if (SYS_CARD_META[key]) return { key, sys: true, ...SYS_CARD_META[key], fields: SYS_CARD_META[key].kind === "training" ? FIELD_TEMPLATES.training : [] };
+                const c = dataCards.find(x => x.id === key);
+                if (!c) return null;
+                return { key, sys: false, name: c.name, icon: c.icon, color: c.color, kind: "custom", fields: toArr(c.fields) };
+            };
+            const getRecords = (key) => SYS_CARD_META[key] ? toArr(dataSysRecords[key]) : toArr((dataCards.find(c => c.id === key) || {}).records);
+            const persistCards = async (next) => { setDataCards(next); await dbPut("veriler", "kartlar", next); };
+            const saveRecords = async (key, recs) => {
+                if (SYS_CARD_META[key]) { const next = { ...dataSysRecords, [key]: recs }; setDataSysRecords(next); await dbPut("veriler", "sistem_kayitlari", next); }
+                else { await persistCards(dataCards.map(c => c.id === key ? { ...c, records: recs } : c)); }
+            };
+            const adjustSysTotals = async (key, dE, dK) => {
+                const nz = (v) => Math.max(0, v);
+                if (key === "aep") { const u = { egitimToplam: nz(aepData.egitimToplam + dE), katilimciToplam: nz(aepData.katilimciToplam + dK) }; setAepData(u); await dbPut("veriler", "aep_stats", u); }
+                else if (key === "eoe") { const u = { eoeToplam: nz(eoeData.eoeToplam + dE), eoeKatilimciToplam: nz(eoeData.eoeKatilimciToplam + dK) }; setEoeData(u); await dbPut("veriler", "eoe_stats", u); }
+                else if (key === "modular") { const u = { egitimToplam: nz(modularAepData.egitimToplam + dE), katilimciToplam: nz(modularAepData.katilimciToplam + dK) }; setModularAepData(u); await dbPut("veriler", "modular_aep_stats", u); }
+            };
+            const sysTotalsText = (key) => key === "aep" ? aepData.egitimToplam + " Eğitim / " + aepData.katilimciToplam + " Kişi" : key === "eoe" ? eoeData.eoeToplam + " Eğitim / " + eoeData.eoeKatilimciToplam + " Kişi" : modularAepData.egitimToplam + " Eğitim / " + modularAepData.katilimciToplam + " Kişi";
+            const cardSums = (fields, recs) => fields.filter(f => f.type === "number").map(f => ({ label: f.label, sum: recs.reduce((a, r) => a + toInt((r.values || {})[f.key]), 0) }));
+            const changeDanismanlik = async (k, d) => { const u = { ...danismanlikData, [k]: Math.max(0, (danismanlikData[k] || 0) + d) }; setDanismanlikData(u); await dbPut("veriler", "danismanlik_stats", u); };
+            const recTitle = (meta, r) => {
+                const v = r.values || {};
+                if (meta.fields.some(f => f.key === "ad") && meta.fields.some(f => f.key === "soyad")) { const t = ((v.ad || "") + " " + (v.soyad || "")).trim(); if (t) return t; }
+                for (const f of meta.fields) { if (v[f.key]) return fmtVal(f, v[f.key]); }
+                return "(Boş kayıt)";
+            };
+            const recSubtitle = (meta, r) => {
+                const v = r.values || {};
+                const usedFirst = meta.fields.find(f => v[f.key]);
+                const parts = meta.fields.filter(f => f !== usedFirst && !(f.key === "soyad" && usedFirst && usedFirst.key === "ad") && v[f.key]).slice(0, 3).map(f => f.label + ": " + (fmtVal(f, v[f.key]).length > 40 ? fmtVal(f, v[f.key]).slice(0, 40) + "…" : fmtVal(f, v[f.key])));
+                return parts.join("  ·  ");
+            };
+            const openNewCard = () => setCardModal({ mode: "new", draft: { name: "", icon: "📋", color: C.teal, template: "person", fields: FIELD_TEMPLATES.person.map(f => ({ ...f })) } });
+            const openEditCard = (id) => { const c = dataCards.find(x => x.id === id); if (!c) return; setCardModal({ mode: "edit", id, draft: { name: c.name, icon: c.icon, color: c.color, template: c.template || "custom", fields: toArr(c.fields).map(f => ({ ...f })) } }); };
+            const saveCardModal = async () => {
+                if (!cardModal) return;
+                const d = cardModal.draft;
+                const fields = d.fields.map(f => ({ key: f.key, label: (f.label || "").trim(), type: f.type || "text" })).filter(f => f.label);
+                if (!d.name.trim() || fields.length === 0) { alert("Kart adı ve en az bir alan adı girin."); return; }
+                if (cardModal.mode === "new") { await persistCards([...dataCards, { id: "c" + Date.now(), name: d.name.trim(), icon: d.icon, color: d.color, template: d.template, fields, records: [] }]); }
+                else { await persistCards(dataCards.map(c => c.id === cardModal.id ? { ...c, name: d.name.trim(), icon: d.icon, color: d.color, fields } : c)); }
+                setCardModal(null);
+            };
+            const deleteCardFromModal = async () => {
+                if (!cardModal || cardModal.mode !== "edit") return;
+                const c = dataCards.find(x => x.id === cardModal.id);
+                if (!c) return;
+                if (!window.confirm("\"" + c.name + "\" kartı ve içindeki tüm kayıtlar silinsin mi? Bu işlem geri alınamaz.")) return;
+                for (const r of toArr(c.records)) { for (const f of toArr(r.files)) { if (f.storagePath && window.fbStorage && window.fbDeleteObject) { try { await window.fbDeleteObject(window.fbStorageRef(window.fbStorage, f.storagePath)); } catch (e) {} } } }
+                await persistCards(dataCards.filter(x => x.id !== cardModal.id));
+                setActiveDataCard(null); setCardModal(null);
+            };
+            const openNewRecord = (key) => {
+                const meta = getCardMeta(key); if (!meta) return;
+                const values = {}; const today = new Date().toISOString().split("T")[0];
+                meta.fields.forEach(f => { values[f.key] = f.type === "date" ? today : ""; });
+                setRecModal({ cardKey: key, isNew: true, draft: { id: Date.now(), values, files: [] }, uploaded: [], removed: [] });
+            };
+            const openEditRecord = (key, r) => setRecModal({ cardKey: key, isNew: false, draft: { ...r, values: { ...(r.values || {}) }, files: toArr(r.files) }, uploaded: [], removed: [] });
+            const deleteStorageFile = async (f) => { if (f && f.storagePath && window.fbStorage && window.fbDeleteObject) { try { await window.fbDeleteObject(window.fbStorageRef(window.fbStorage, f.storagePath)); } catch (e) { console.warn("Storage silme hatası:", e); } } };
+            const saveRecordModal = async () => {
+                if (!recModal) return;
+                const { cardKey, draft, removed } = recModal;
+                const meta = getCardMeta(cardKey); if (!meta) return;
+                const values = {}; meta.fields.forEach(f => { values[f.key] = String((draft.values || {})[f.key] || "").trim(); });
+                if (!Object.values(values).some(v => v) && toArr(draft.files).length === 0) { alert("En az bir alanı doldurun."); return; }
+                const now = new Date().toISOString();
+                const rec = { id: draft.id, createdAt: draft.createdAt || now, updatedAt: now, values, files: toArr(draft.files) };
+                const recs = getRecords(cardKey);
+                const old = recs.find(r => r.id === rec.id);
+                await saveRecords(cardKey, old ? recs.map(r => r.id === rec.id ? rec : r) : [rec, ...recs]);
+                if (meta.sys && meta.kind === "training") { await adjustSysTotals(cardKey, old ? 0 : 1, toInt(values.kisi) - (old ? toInt((old.values || {}).kisi) : 0)); }
+                for (const f of (removed || [])) { await deleteStorageFile(f); }
+                setRecModal(null);
+            };
+            const cancelRecordModal = async () => {
+                if (!recModal) return;
+                const up = recModal.uploaded || [];
+                const toDelete = toArr(recModal.draft.files).filter(f => up.includes(f.id));
+                setRecModal(null);
+                for (const f of toDelete) { await deleteStorageFile(f); }
+            };
+            const deleteRecord = async (cardKey, rec) => {
+                if (!window.confirm("Bu kayıt silinsin mi?")) return;
+                for (const f of toArr(rec.files)) { await deleteStorageFile(f); }
+                await saveRecords(cardKey, getRecords(cardKey).filter(r => r.id !== rec.id));
+                const meta = getCardMeta(cardKey);
+                if (meta && meta.sys && meta.kind === "training") { await adjustSysTotals(cardKey, -1, -toInt((rec.values || {}).kisi)); }
+                setRecModal(null);
+            };
+            const handleRecordFileUpload = async (e) => {
+                const files = Array.from(e.target.files || []);
+                e.target.value = "";
+                if (!files.length || !recModal) return;
+                const cardKey = recModal.cardKey, rid = recModal.draft.id;
+                setRecUploading(true);
+                try {
+                    if (!window.fbStorage) throw new Error("Depolama hazır değil");
+                    for (const file of files) {
+                        if (file.size > 25 * 1024 * 1024) { alert(file.name + " 25 MB sınırını aşıyor, atlandı."); continue; }
+                        const path = "dosyalar/veriler/" + cardKey + "_" + rid + "/" + Date.now() + "_" + file.name;
+                        const sRef = window.fbStorageRef(window.fbStorage, path);
+                        await window.fbUploadBytes(sRef, file);
+                        const url = await window.fbGetDownloadURL(sRef);
+                        const nf = { id: Date.now() + Math.floor(Math.random() * 1000), name: file.name, size: (file.size / 1024 / 1024).toFixed(2) + " MB", date: new Date().toLocaleDateString("tr-TR"), type: file.type || "", url, storagePath: path };
+                        setRecModal(m => m ? { ...m, draft: { ...m.draft, files: [...toArr(m.draft.files), nf] }, uploaded: [...(m.uploaded || []), nf.id] } : m);
+                    }
+                } catch (err) { alert("Yükleme hatası: " + err.message); console.error(err); }
+                setRecUploading(false);
+            };
+            const removeRecordFile = (f) => {
+                if (!window.confirm(f.name + " kaldırılsın mı?")) return;
+                setRecModal(m => { if (!m) return m; const wasUploaded = (m.uploaded || []).includes(f.id); if (wasUploaded) { deleteStorageFile(f); } return { ...m, draft: { ...m.draft, files: toArr(m.draft.files).filter(x => x.id !== f.id) }, removed: wasUploaded ? (m.removed || []) : [...(m.removed || []), f] }; });
+            };
             const [planPlatform, setPlanPlatform] = useState("Zoom");
             const [planLink, setPlanLink] = useState("");
             // ── ONLINE TERAPİ YARDIMCILARI ──
@@ -886,11 +1027,16 @@
                         const savedEoeData = await dbGet("veriler", "eoe_stats", null);
                         const savedDanismanlikData = await dbGet("veriler", "danismanlik_stats", null);
                         const savedModularAepData = await dbGet("veriler", "modular_aep_stats", null);
+                        const savedDataCards = await dbGet("veriler", "kartlar", null);
+                        const savedSysRecords = await dbGet("veriler", "sistem_kayitlari", null);
                         const savedCalendarNotes = await dbGet("notlar", "takvim_notlari", null);
                         if(savedAepData) setAepData(savedAepData);
                         if(savedEoeData) setEoeData(savedEoeData);
                         if(savedDanismanlikData) setDanismanlikData(savedDanismanlikData);
                         if(savedModularAepData) setModularAepData(savedModularAepData);
+                        const normRec = (r) => ({ ...r, values: r.values || {}, files: toArr(r.files) });
+                        if(savedDataCards) setDataCards(toArr(savedDataCards).map(c => ({ ...c, fields: toArr(c.fields), records: toArr(c.records).map(normRec) })));
+                        if(savedSysRecords && typeof savedSysRecords === "object") { const o = {}; Object.keys(savedSysRecords).forEach(k => { o[k] = toArr(savedSysRecords[k]).map(normRec); }); setDataSysRecords(o); }
                         if(savedCalendarNotes) setCalendarNotes(savedCalendarNotes);
                         if(savedMaterials) {
                             // Firebase'den gelen veriyi varsayılan yapıyla merge et
@@ -956,36 +1102,68 @@ useEffect(() => {
             useEffect(() => { if(isInitialLoadComplete) { dbPut("kutuphane", "kitaplarim", kitaplarim); } }, [kitaplarim, isInitialLoadComplete]);
             useEffect(() => { if(isInitialLoadComplete) { dbPut("kutuphane", "alacaklarim", alacaklarim); } }, [alacaklarim, isInitialLoadComplete]);
 
-            // Günlük AI psikoloji bilgisi — günde bir kez, localStorage ile önbellek
-            useEffect(() => {
+            // Günlük AI psikoloji bilgisi — günde bir kez; daha önce gösterilen konular tekrar edilmez
+            const INSIGHT_TOPICS = ["Bilişsel Davranışçı Terapi", "Şema Terapi", "Kabul ve Kararlılık Terapisi (ACT)", "Diyalektik Davranış Terapisi", "Çözüm Odaklı Kısa Terapi", "Motivasyonel Görüşme", "Travma ve Travma Sonrası Büyüme", "Bağlanma Kuramı", "Nörobilim ve Beyin", "Mindfulness", "Duygu Düzenleme", "Aile Sistemleri Kuramı", "Çift Terapisi", "Boşanma Süreci ve Ebeveynlik", "Çocuk Gelişimi", "Ergenlik Psikolojisi", "Oyun Terapisi", "Okul Psikolojik Danışmanlığı", "Yas ve Kayıp", "Öfke Yönetimi", "Sosyal Kaygı", "Obsesif Kompulsif Bozukluk", "Depresyon", "Panik ve Kaygı Bozuklukları", "Uyku ve Ruh Sağlığı", "Kriz Müdahalesi", "İntihar ve Kendine Zarar Verme Önleme", "Terapötik İttifak", "Süpervizyon ve Meslek Etiği", "Tükenmişlik ve Danışman Öz Bakımı", "Dijital Bağımlılık ve Ekran Kullanımı", "Aile İçi Şiddet ve Mağdur Desteği", "Risk Altındaki Aileler ve Sosyal Hizmet", "Bilişsel Çarpıtmalar", "Psikoeğitim Teknikleri", "Ölçme ve Değerlendirme", "Kültürel Duyarlılık", "Pozitif Psikoloji", "Gestalt ve Şimdiki An", "Bowen Aile Sistemleri", "Beden-Zihin Bağlantısı", "Ebeveynlik Stilleri", "Kardeş İlişkileri", "Ergenlerde Akran Zorbalığı", "Karar Verme ve Bilişsel Önyargılar", "Stres ve Başa Çıkma", "Kimlik Gelişimi", "Madde Kullanımı ve Bağımlılık", "Yaşlılık ve Yaşam Dönemi Geçişleri", "Grup Terapisi ve Grup Dinamikleri"];
+            const getInsightHistory = async () => {
+                let local = []; try { local = JSON.parse(localStorage.getItem("psiko_daily_history") || "[]"); } catch (e) {}
+                let remote = []; try { remote = toArr(await dbGet("veriler", "gunluk_bilgi_gecmisi", [])); } catch (e) {}
+                const seen = new Set(); const merged = [];
+                [...toArr(remote), ...toArr(local)].forEach(h => { if (!h || !h.b) return; const k = (h.t || "") + "|" + h.b; if (seen.has(k)) return; seen.add(k); merged.push(h); });
+                merged.sort((x, y) => (x.t || "").localeCompare(y.t || ""));
+                return merged.slice(-300);
+            };
+            const saveInsightHistory = async (list) => {
+                try { localStorage.setItem("psiko_daily_history", JSON.stringify(list)); } catch (e) {}
+                await dbPut("veriler", "gunluk_bilgi_gecmisi", list);
+            };
+            const loadDailyInsight = async (forceNew) => {
                 const today = new Date().toISOString().split("T")[0];
                 const cacheKey = `psiko_daily_insight_${today}`;
-                const cached = localStorage.getItem(cacheKey);
-                if (cached) { try { setDailyInsight(JSON.parse(cached)); } catch(e){} return; }
+                if (!forceNew) {
+                    const cached = localStorage.getItem(cacheKey);
+                    if (cached) { try { setDailyInsight(JSON.parse(cached)); } catch (e) {} return; }
+                }
                 const apiKey = localStorage.getItem("psiko_gemini_key");
-                if (!apiKey) return;
+                if (!apiKey) { if (forceNew) alert("Lütfen önce API Key ekleyin (sağ üst köşe 🔑)"); return; }
+                if (forceNew) setDailyInsight(null);
                 setDailyInsightLoading(true);
-                const prompt = `Sen deneyimli bir klinik psikolog ve psikolojik danışmansın. Bugün için psikoloji ve psikolojik danışmanlık alanında güncel, ilham verici ve pratik tek bir "günlük bilgi" hazırla. Yanıtını aşağıdaki JSON formatında ver:
+                try {
+                    const history = await getInsightHistory();
+                    const recentTopics = history.slice(-12).map(h => h.k);
+                    const pool = INSIGHT_TOPICS.filter(t => !recentTopics.includes(t));
+                    const choices = pool.length ? pool : INSIGHT_TOPICS;
+                    const topic = choices[Math.floor(Math.random() * choices.length)];
+                    const used = history.slice(-80).map(h => h.b).join(" | ");
+                    const prompt = `Sen deneyimli bir klinik psikolog ve psikolojik danışmansın. Psikoloji ve psikolojik danışmanlık alanında pratik ve ilham verici tek bir "günlük bilgi" hazırla.
+
+BUGÜNÜN KONU ALANI: ${topic}
+Bilgiyi bu alandan seç ve alan içinde de az bilinen, somut bir kavram, araştırma bulgusu, teknik veya uygulama ipucu işle. Genel geçer, klişe bilgilerden (örneğin "psikolojik dayanıklılık", "gelişim zihniyeti", "nefes egzersizi" gibi) kaçın.
+
+DAHA ÖNCE GÖSTERİLEN BAŞLIKLAR (bunları ve aynı kavramları kesinlikle tekrar etme): ${used || "yok"}
+
+Yanıtını aşağıdaki JSON formatında ver:
 {
   "baslik": "Kısa ve dikkat çekici başlık (maksimum 7 kelime)",
   "bilgi": "Bilgilendirici açıklama. Bilimsel temelli, pratik ve anlamlı olsun. 2-3 cümle.",
-  "kategori": "Tek bir kategori (örn: Bilişsel Davranışçı Terapi, Travma, Nörobilim, Mindfulness, Aile Dinamikleri, Pozitif Psikoloji, Kriz Müdahalesi)",
+  "kategori": "${topic}",
   "ipucu": "Danışmanlık pratiğinde bunu nasıl kullanabilirsin? Kısa bir öneri (1 cümle)."
 }
 Sadece geçerli JSON döndür, başka metin ekleme.`;
-                callGeminiAPI(prompt).then(text => {
+                    const text = await callGeminiAPI(prompt);
+                    let json;
                     try {
-                        const clean = text.replace(/```json\n?/g,"").replace(/```\n?/g,"").trim();
-                        const json = JSON.parse(clean);
-                        localStorage.setItem(cacheKey, JSON.stringify(json));
-                        setDailyInsight(json);
-                    } catch(e) {
-                        const fallback = {baslik:"Psikolojik Dayanıklılık", bilgi: text.substring(0,220), kategori:"Genel", ipucu:""};
-                        setDailyInsight(fallback);
+                        const clean = text.replace(/```json\n?/g, "").replace(/```\n?/g, "").trim();
+                        json = JSON.parse(clean);
+                    } catch (e) {
+                        json = { baslik: "Psikolojik Bilgi", bilgi: text.substring(0, 220), kategori: topic, ipucu: "" };
                     }
-                    setDailyInsightLoading(false);
-                }).catch(() => setDailyInsightLoading(false));
-            }, []);
+                    try { localStorage.setItem(cacheKey, JSON.stringify(json)); } catch (e) {}
+                    setDailyInsight(json);
+                    await saveInsightHistory([...history, { t: today, b: json.baslik || "", k: topic }].slice(-300));
+                } catch (e) { console.warn("Günlük bilgi alınamadı:", e); }
+                setDailyInsightLoading(false);
+            };
+            useEffect(() => { loadDailyInsight(false); }, []);
 
             window.closeAllMenus = () => {
                 setOpenStatusMenuId(null);
@@ -2599,6 +2777,10 @@ Belge başlığı, tarih, danışan bilgileri, klinik bulgular, değerlendirme v
                     { text: `Boşanma Danışmanlığı: ${danismanlikData.bosanma}\nAile Danışmanlığı: ${danismanlikData.aile}\nBireysel Danışmanlık: ${danismanlikData.bireysel}\nOnline Terapi: ${danismanlikData.online || 0}` },
                     { heading: "Modüler AEP" },
                     { text: `Toplam Eğitim: ${modularAepData.egitimToplam}\nToplam Katılımcı: ${modularAepData.katilimciToplam}` },
+                    ...dataCards.flatMap(c => [
+                        { heading: c.name },
+                        { text: `Kayıt Sayısı: ${toArr(c.records).length}` + cardSums(toArr(c.fields), toArr(c.records)).map(x => `\n${x.label} Toplamı: ${x.sum}`).join("") }
+                    ])
                 ];
                 if (format === "pdf") exportToPDF(title, sections);
                 else if (format === "word") exportToWordSimple(title, sections);
@@ -2994,20 +3176,7 @@ Belge başlığı, tarih, danışan bilgileri, klinik bulgular, değerlendirme v
           <div style={{fontSize:10,color:C.textMuted}}>{new Date().toLocaleDateString("tr-TR",{day:"numeric",month:"long",year:"numeric"})}</div>
         </div>
       </div>
-      <button onClick={()=>{
-        const today=new Date().toISOString().split("T")[0];
-        localStorage.removeItem(`psiko_daily_insight_${today}`);
-        setDailyInsight(null);
-        const apiKey=localStorage.getItem("psiko_gemini_key");
-        if(!apiKey){alert("Lütfen önce API Key ekleyin (sağ üst köşe 🔑)");return;}
-        setDailyInsightLoading(true);
-        const prompt=`Sen deneyimli bir klinik psikolog ve psikolojik danışmansın. Bugün için psikoloji ve psikolojik danışmanlık alanında güncel, ilham verici ve pratik tek bir "günlük bilgi" hazırla. Yanıtını aşağıdaki JSON formatında ver:\n{\n  "baslik": "Kısa ve dikkat çekici başlık (maksimum 7 kelime)",\n  "bilgi": "Bilgilendirici açıklama. Bilimsel temelli, pratik ve anlamlı olsun. 2-3 cümle.",\n  "kategori": "Tek bir kategori (örn: Bilişsel Davranışçı Terapi, Travma, Nörobilim, Mindfulness, Aile Dinamikleri, Pozitif Psikoloji, Kriz Müdahalesi)",\n  "ipucu": "Danışmanlık pratiğinde bunu nasıl kullanabilirsin? Kısa bir öneri (1 cümle)."\n}\nSadece geçerli JSON döndür.`;
-        callGeminiAPI(prompt).then(text=>{
-          try{const c=text.replace(/```json\n?/g,"").replace(/```\n?/g,"").trim();const j=JSON.parse(c);localStorage.setItem(`psiko_daily_insight_${today}`,JSON.stringify(j));setDailyInsight(j);}
-          catch(e){setDailyInsight({baslik:"Psikolojik Dayanıklılık",bilgi:text.substring(0,220),kategori:"Genel",ipucu:""});}
-          setDailyInsightLoading(false);
-        }).catch(()=>setDailyInsightLoading(false));
-      }} style={{background:"none",border:`1px solid ${C.border}`,color:C.textMuted,padding:"4px 10px",borderRadius:8,cursor:"pointer",fontSize:12,flexShrink:0}} title="Yenile">↺ Yenile</button>
+      <button onClick={()=>loadDailyInsight(true)} style={{background:"none",border:`1px solid ${C.border}`,color:C.textMuted,padding:"4px 10px",borderRadius:8,cursor:"pointer",fontSize:12,flexShrink:0}} title="Yeni bilgi getir">↺ Yenile</button>
     </div>
 
     {/* İçerik */}
@@ -4140,7 +4309,92 @@ Belge başlığı, tarih, danışan bilgileri, klinik bulgular, değerlendirme v
                             )}
                         </div>)}
                     </div>)}
-                    {screen === "data_records" && (<div style={{padding:"40px 8% 120px"}}><div style={{marginBottom: 40}}><h2 style={{fontSize: 32, margin: 0}}>Veri Kayıtları</h2><p style={{color: C.textMuted}}>Aile eğitimleri ve danışmanlık istatistikleri.</p><div style={{display:"flex", gap:8, marginTop:15}}><button className="btn" style={{background:"#e74c3c20", color:"#e74c3c", fontSize:12}} onClick={()=>exportDataRecords("pdf")}>📕 PDF Rapor</button><button className="btn btn-teal" style={{fontSize:12}} onClick={()=>exportDataRecords("word")}>📄 Word Rapor</button><button className="btn" style={{background:`${C.violet}20`, color:C.violet, fontSize:12}} onClick={()=>exportDataRecords("ppt")}>📊 PPT Rapor</button></div></div><div className="data-grid"><div className="data-card card-hover" onClick={() => setShowAepModal(true)}><div className="data-icon">👨‍👩‍👧‍👦</div><h3 style={{margin:0}}>Aile Eğitim Programı</h3><div style={{fontSize: 22, fontWeight: 800, color: C.teal, margin: "10px 0"}}>{aepData.egitimToplam} Eğitim / {aepData.katilimciToplam} Kişi</div><button className="btn btn-teal" style={{width:"100%", fontSize:12}}>Veri Ekle</button></div><div className="data-card card-hover" onClick={() => setShowEoeModal(true)}><div className="data-icon">💍</div><h3 style={{margin:0}}>Evlilik Öncesi Eğitim</h3><div style={{fontSize: 22, fontWeight: 800, color: C.accent, margin: "10px 0"}}>{eoeData.eoeToplam} Eğitim / {eoeData.eoeKatilimciToplam} Kişi</div><button className="btn btn-teal" style={{width:"100%", fontSize:12}}>Veri Ekle</button></div><div className="data-card card-hover" onClick={() => setShowDanismanlikModal(true)}><div className="data-icon">📈</div><h3 style={{margin:0}}>Danışmanlık Sayısı</h3><div style={{fontSize: 14, fontWeight: 600, color: C.violet, margin: "10px 0", lineHeight: 1.6}}>Boşanma: {danismanlikData.bosanma}<br/>Aile: {danismanlikData.aile}<br/>Bireysel: {danismanlikData.bireysel}<br/>Online: {danismanlikData.online || 0}</div><button className="btn btn-teal" style={{width:"100%", fontSize:12}}>Veri Ekle</button></div><div className="data-card card-hover" onClick={() => setShowModularAepModal(true)}><div className="data-icon">🧩</div><h3 style={{margin:0}}>Modüler AEP</h3><div style={{fontSize: 22, fontWeight: 800, color: C.rose, margin: "10px 0"}}>{modularAepData.egitimToplam} Eğitim / {modularAepData.katilimciToplam} Kişi</div><button className="btn btn-teal" style={{width:"100%", fontSize:12}}>Veri Ekle</button></div></div></div>)}
+                    {screen === "data_records" && !activeDataCard && (<div style={{padding:"40px 8% 120px"}}><div style={{marginBottom: 40}}><h2 style={{fontSize: 32, margin: 0}}>Veri Kayıtları</h2><p style={{color: C.textMuted}}>Aile eğitimleri ve danışmanlık istatistikleri.</p><div style={{display:"flex", gap:8, marginTop:15}}><button className="btn" style={{background:"#e74c3c20", color:"#e74c3c", fontSize:12}} onClick={()=>exportDataRecords("pdf")}>📕 PDF Rapor</button><button className="btn btn-teal" style={{fontSize:12}} onClick={()=>exportDataRecords("word")}>📄 Word Rapor</button><button className="btn" style={{background:`${C.violet}20`, color:C.violet, fontSize:12}} onClick={()=>exportDataRecords("ppt")}>📊 PPT Rapor</button></div></div><div className="data-grid"><div className="data-card card-hover" onClick={() => {setActiveDataCard("aep"); setRecSearch("");}}><div className="data-icon">👨‍👩‍👧‍👦</div><h3 style={{margin:0}}>Aile Eğitim Programı</h3><div style={{fontSize: 22, fontWeight: 800, color: C.teal, margin: "10px 0"}}>{aepData.egitimToplam} Eğitim / {aepData.katilimciToplam} Kişi</div><button className="btn btn-teal" style={{width:"100%", fontSize:12}}>Aç</button></div><div className="data-card card-hover" onClick={() => {setActiveDataCard("eoe"); setRecSearch("");}}><div className="data-icon">💍</div><h3 style={{margin:0}}>Evlilik Öncesi Eğitim</h3><div style={{fontSize: 22, fontWeight: 800, color: C.accent, margin: "10px 0"}}>{eoeData.eoeToplam} Eğitim / {eoeData.eoeKatilimciToplam} Kişi</div><button className="btn btn-teal" style={{width:"100%", fontSize:12}}>Aç</button></div><div className="data-card card-hover" onClick={() => {setActiveDataCard("danismanlik"); setRecSearch("");}}><div className="data-icon">📈</div><h3 style={{margin:0}}>Danışmanlık Sayısı</h3><div style={{fontSize: 14, fontWeight: 600, color: C.violet, margin: "10px 0", lineHeight: 1.6}}>Boşanma: {danismanlikData.bosanma}<br/>Aile: {danismanlikData.aile}<br/>Bireysel: {danismanlikData.bireysel}<br/>Online: {danismanlikData.online || 0}</div><button className="btn btn-teal" style={{width:"100%", fontSize:12}}>Aç</button></div><div className="data-card card-hover" onClick={() => {setActiveDataCard("modular"); setRecSearch("");}}><div className="data-icon">🧩</div><h3 style={{margin:0}}>Modüler AEP</h3><div style={{fontSize: 22, fontWeight: 800, color: C.rose, margin: "10px 0"}}>{modularAepData.egitimToplam} Eğitim / {modularAepData.katilimciToplam} Kişi</div><button className="btn btn-teal" style={{width:"100%", fontSize:12}}>Aç</button></div>{dataCards.map(c => (<div key={c.id} className="data-card card-hover" onClick={() => {setActiveDataCard(c.id); setRecSearch("");}}><div className="data-icon">{c.icon}</div><h3 style={{margin:0}}>{c.name}</h3><div style={{fontSize: 22, fontWeight: 800, color: c.color, margin: "10px 0"}}>{toArr(c.records).length} Kayıt</div><button className="btn btn-teal" style={{width:"100%", fontSize:12}}>Aç</button></div>))}<div className="data-card card-hover" style={{borderStyle:"dashed", display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"center", cursor:"pointer", minHeight:170}} onClick={openNewCard}><div className="data-icon">➕</div><h3 style={{margin:0}}>Yeni Kart Ekle</h3><div style={{fontSize:12, color:C.textMuted, marginTop:8}}>Kendi veri kartınızı oluşturun</div></div></div></div>)}
+                    {screen === "data_records" && activeDataCard && (() => {
+                        const meta = getCardMeta(activeDataCard);
+                        if (!meta) return null;
+                        const recs = getRecords(activeDataCard);
+                        const term = recSearch.trim().toLocaleLowerCase("tr-TR");
+                        const shown = term ? recs.filter(r => Object.values(r.values || {}).some(v => String(v).toLocaleLowerCase("tr-TR").includes(term))) : recs;
+                        const sums = meta.kind === "custom" ? cardSums(meta.fields, recs) : [];
+                        const summary = meta.kind === "counter" ? "" : (meta.sys ? sysTotalsText(activeDataCard) : recs.length + " kayıt" + sums.map(x => "  ·  " + x.label + " toplamı: " + x.sum).join(""));
+                        const openLegacy = () => { if (activeDataCard === "aep") setShowAepModal(true); else if (activeDataCard === "eoe") setShowEoeModal(true); else if (activeDataCard === "modular") setShowModularAepModal(true); };
+                        return (<div style={{padding:"40px 8% 120px"}}>
+                            <div style={{display:"flex", justifyContent:"space-between", alignItems:"center", gap:10, flexWrap:"wrap", marginBottom:24}}>
+                                <button className="btn" style={{padding:"8px 15px", background:C.border}} onClick={() => setActiveDataCard(null)}>← Veriler</button>
+                                {!meta.sys && <button className="btn" style={{background:`${C.accent}20`, color:C.accent, fontSize:12}} onClick={() => openEditCard(activeDataCard)}>⚙️ Kartı Düzenle</button>}
+                            </div>
+                            <div style={{display:"flex", alignItems:"center", gap:14, marginBottom:20}}>
+                                <div style={{fontSize:40}}>{meta.icon}</div>
+                                <div><h2 style={{margin:0, fontSize:28}}>{meta.name}</h2>{summary && <div style={{color:meta.color, fontWeight:800, fontSize:15, marginTop:4}}>{summary}</div>}</div>
+                            </div>
+                            {meta.kind === "counter" ? (<div>
+                                {[["bosanma", "Boşanma Süreci Danışmanlığı"], ["aile", "Aile Danışmanlığı"], ["bireysel", "Bireysel Danışmanlık"], ["online", "Online Terapi"]].map(([k, l]) => (<div key={k} className="card" style={{display:"flex", alignItems:"center", justifyContent:"space-between", gap:10, padding:"14px 18px", marginBottom:10}}>
+                                    <div style={{fontSize:15, fontWeight:600}}>{l}</div>
+                                    <div style={{display:"flex", alignItems:"center", gap:12}}><button className="btn" style={{background:C.border, padding:"6px 14px", fontSize:16}} onClick={() => changeDanismanlik(k, -1)}>−</button><div style={{fontSize:22, fontWeight:800, color:meta.color, minWidth:40, textAlign:"center"}}>{danismanlikData[k] || 0}</div><button className="btn btn-teal" style={{padding:"6px 14px", fontSize:16}} onClick={() => changeDanismanlik(k, 1)}>+</button></div>
+                                </div>))}
+                                <button className="btn" style={{background:C.border, fontSize:12, marginTop:6}} onClick={() => setShowDanismanlikModal(true)}>🧮 Toplu Veri Ekle</button>
+                            </div>) : (<div>
+                                <div style={{display:"flex", gap:8, flexWrap:"wrap", marginBottom:12}}>
+                                    <button className="btn btn-teal" onClick={() => openNewRecord(activeDataCard)}>➕ {meta.kind === "training" ? "Eğitim Ekle" : "Kayıt Ekle"}</button>
+                                    {meta.sys && <button className="btn" style={{background:C.border, fontSize:12}} onClick={openLegacy}>🧮 Önceki Toplamı Ekle / Düzelt</button>}
+                                </div>
+                                {meta.sys && <div style={{fontSize:11, color:C.textMuted, marginBottom:14, lineHeight:1.5}}>Buraya eklediğiniz her eğitim yukarıdaki toplama otomatik işlenir. Daha önce girdiğiniz toplam sayılar korunur. "Önceki Toplam" ile fark ekleyebilir, eksi sayı girerek düşebilirsiniz.</div>}
+                                {recs.length > 0 && <input placeholder="🔍 Kayıtlarda ara..." value={recSearch} onChange={(e) => setRecSearch(e.target.value)} style={{marginBottom:14}} />}
+                                {recs.length === 0 && <div style={{color:C.textMuted, fontSize:14, padding:"20px 0"}}>Henüz kayıt yok. "{meta.kind === "training" ? "Eğitim Ekle" : "Kayıt Ekle"}" ile ilk kaydı oluşturun.</div>}
+                                {recs.length > 0 && shown.length === 0 && <div style={{color:C.textMuted, fontSize:14}}>Aramaya uygun kayıt bulunamadı.</div>}
+                                {shown.map(r => (<div key={r.id} className="card" style={{cursor:"pointer", padding:"14px 16px", marginBottom:10}} onClick={() => openEditRecord(activeDataCard, r)}>
+                                    <div style={{display:"flex", justifyContent:"space-between", gap:8}}><b style={{fontSize:15}}>{recTitle(meta, r)}</b>{toArr(r.files).length > 0 && <span style={{fontSize:11, color:C.violet, fontWeight:700}}>📎 {toArr(r.files).length}</span>}</div>
+                                    {recSubtitle(meta, r) && <div style={{fontSize:12, color:C.textMuted, marginTop:5, lineHeight:1.5}}>{recSubtitle(meta, r)}</div>}
+                                </div>))}
+                            </div>)}
+                        </div>);
+                    })()}
+                    {cardModal && (() => {
+                        const d = cardModal.draft;
+                        const setD = (patch) => setCardModal({ ...cardModal, draft: { ...d, ...patch } });
+                        const setField = (i, patch) => setD({ fields: d.fields.map((f, idx) => idx === i ? { ...f, ...patch } : f) });
+                        const pickTemplate = (t) => setD({ template: t, fields: t === "custom" ? [{ key: newFieldKey(), label: "", type: "text" }] : FIELD_TEMPLATES[t].map(f => ({ ...f })) });
+                        return (<div className="modal-overlay"><div className="plan-modal" style={{maxWidth:520, width:"94%", maxHeight:"90vh", overflowY:"auto"}}>
+                            <h3 style={{marginTop:0, color:d.color}}>{cardModal.mode === "new" ? "➕ Yeni Veri Kartı" : "⚙️ Kartı Düzenle"}</h3>
+                            <label>Kart Adı</label><input placeholder="Örn: Sosyal Risk Analizi" value={d.name} onChange={(e) => setD({ name: e.target.value })} />
+                            <label>Simge</label>
+                            <div style={{display:"flex", gap:6, flexWrap:"wrap"}}>{CARD_ICONS.map(ic => (<div key={ic} onClick={() => setD({ icon: ic })} style={{fontSize:22, padding:"4px 8px", borderRadius:10, cursor:"pointer", border: d.icon === ic ? `2px solid ${d.color}` : "2px solid transparent", background:"rgba(127,127,127,0.12)"}}>{ic}</div>))}</div>
+                            <label>Renk</label>
+                            <div style={{display:"flex", gap:10}}>{CARD_COLORS.map(cl => (<div key={cl} onClick={() => setD({ color: cl })} style={{width:28, height:28, borderRadius:"50%", background:cl, cursor:"pointer", border: d.color === cl ? "3px solid #fff" : "3px solid transparent", boxSizing:"border-box"}} />))}</div>
+                            {cardModal.mode === "new" && (<div><label>Kayıt Şablonu</label><div style={{display:"flex", gap:6, flexWrap:"wrap"}}>{[["training", "🎓 Eğitim Kaydı"], ["person", "👤 Kişi / Dosya Kaydı"], ["custom", "🛠️ Özel Alanlar"]].map(([k, l]) => (<button key={k} className="btn" style={{fontSize:12, padding:"8px 12px", background: d.template === k ? `${d.color}30` : C.border, color: d.template === k ? d.color : C.textMuted}} onClick={() => pickTemplate(k)}>{l}</button>))}</div></div>)}
+                            <label>Kayıt Alanları</label>
+                            {d.fields.map((f, i) => (<div key={f.key} style={{display:"flex", gap:6, marginBottom:8, alignItems:"center"}}>
+                                <input placeholder="Alan adı" style={{flex:2}} value={f.label} onChange={(e) => setField(i, { label: e.target.value })} />
+                                <select style={{flex:1}} value={f.type} onChange={(e) => setField(i, { type: e.target.value })}>{FIELD_TYPES.map(([v, l]) => (<option key={v} value={v}>{l}</option>))}</select>
+                                <button className="btn" style={{background:C.border, padding:"8px 12px"}} onClick={() => setD({ fields: d.fields.filter((_, idx) => idx !== i) })}>✕</button>
+                            </div>))}
+                            <button className="btn" style={{background:`${d.color}20`, color:d.color, fontSize:12, padding:"8px 14px"}} onClick={() => setD({ fields: [...d.fields, { key: newFieldKey(), label: "", type: "text" }] })}>+ Alan Ekle</button>
+                            <div style={{display:"flex", gap:10, marginTop:24}}><button className="btn" style={{flex:1, background:C.border}} onClick={() => setCardModal(null)}>İptal</button><button className="btn btn-teal" style={{flex:2}} onClick={saveCardModal}>Kaydet</button></div>
+                            {cardModal.mode === "edit" && <button className="btn" style={{width:"100%", marginTop:12, background:"#e74c3c20", color:"#e74c3c", fontSize:12}} onClick={deleteCardFromModal}>🗑️ Kartı ve Tüm Kayıtlarını Sil</button>}
+                        </div></div>);
+                    })()}
+                    {recModal && (() => {
+                        const meta = getCardMeta(recModal.cardKey);
+                        if (!meta) return null;
+                        const d = recModal.draft;
+                        const setVal = (k, v) => setRecModal({ ...recModal, draft: { ...d, values: { ...(d.values || {}), [k]: v } } });
+                        const fileIcon = (f) => (f.type || "").startsWith("image/") ? "🖼️" : ((f.type || "").includes("pdf") ? "📕" : "📄");
+                        return (<div className="modal-overlay"><div className="plan-modal" style={{maxWidth:560, width:"94%", maxHeight:"92vh", overflowY:"auto", borderColor:meta.color}}>
+                            <h3 style={{marginTop:0, color:meta.color}}>{meta.icon} {meta.name} — {recModal.isNew ? "Yeni Kayıt" : "Kayıt"}</h3>
+                            {meta.fields.map(f => (<div key={f.key}>
+                                <label>{f.label}</label>
+                                {f.type === "longtext" ? (<textarea style={{height:90}} value={(d.values || {})[f.key] || ""} onChange={(e) => setVal(f.key, e.target.value)} />)
+                                : f.type === "tel" ? (<div style={{display:"flex", gap:8, alignItems:"center"}}><input type="tel" inputMode="tel" value={(d.values || {})[f.key] || ""} onChange={(e) => setVal(f.key, e.target.value)} />{(d.values || {})[f.key] && <a href={"tel:" + String((d.values || {})[f.key]).replace(/[^\d+]/g, "")} style={{color:meta.color, fontWeight:700, fontSize:13}}>Ara</a>}</div>)
+                                : (<input type={f.type === "number" ? "number" : f.type === "date" ? "date" : "text"} inputMode={f.type === "number" ? "numeric" : undefined} value={(d.values || {})[f.key] || ""} onChange={(e) => setVal(f.key, e.target.value)} />)}
+                            </div>))}
+                            <label>📎 Belgeler ({toArr(d.files).length})</label>
+                            {toArr(d.files).map(f => (<div key={f.id} style={{display:"flex", alignItems:"center", gap:10, background:"rgba(127,127,127,0.1)", borderRadius:8, padding:"8px 12px", marginBottom:8}}>{(f.type || "").startsWith("image/") && f.url ? <img src={f.url} alt="" style={{width:40, height:40, objectFit:"cover", borderRadius:6}} /> : <span style={{fontSize:22}}>{fileIcon(f)}</span>}<div style={{flex:1, minWidth:0}}><div style={{fontSize:13, overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap"}}>{f.name}</div><div style={{fontSize:11, color:C.textMuted}}>{f.size} · {f.date}</div></div>{f.url && <a href={f.url} target="_blank" rel="noopener noreferrer" style={{color:meta.color, fontWeight:700, fontSize:12}}>Aç</a>}<span style={{cursor:"pointer", color:C.rose}} onClick={() => removeRecordFile(f)}>🗑️</span></div>))}
+                            <label className="btn" style={{display:"block", textAlign:"center", marginTop:4, background:`${C.violet}20`, color:C.violet, cursor: recUploading ? "wait" : "pointer"}}>{recUploading ? "Yükleniyor..." : "📎 Belge / Evrak Ekle"}<input type="file" multiple style={{display:"none"}} disabled={recUploading} onChange={handleRecordFileUpload} /></label>
+                            <div style={{display:"flex", gap:10, marginTop:24}}><button className="btn" style={{flex:1, background:C.border}} onClick={cancelRecordModal}>İptal</button><button className="btn btn-teal" style={{flex:2}} disabled={recUploading} onClick={saveRecordModal}>Kaydet</button></div>
+                            {!recModal.isNew && <button className="btn" style={{width:"100%", marginTop:12, background:"#e74c3c20", color:"#e74c3c", fontSize:12}} onClick={() => deleteRecord(recModal.cardKey, d)}>🗑️ Kaydı Sil</button>}
+                        </div></div>);
+                    })()}
                     {showModularAepModal && (<div className="modal-overlay"><div className="plan-modal" style={{borderColor: C.rose}}><h3 style={{marginTop:0, color:C.rose}}>🧩 Modüler AEP Veri Girişi</h3><p style={{fontSize:12, color:C.textMuted, marginBottom:15}}>Mevcut Toplam: {modularAepData.egitimToplam} Eğitim, {modularAepData.katilimciToplam} Katılımcı</p><label>Yeni Eğitim Sayısı</label><input type="number" placeholder="Sayı girin..." value={modularAepInput.egitim} onChange={(e)=>setModularAepInput({...modularAepInput, egitim: e.target.value})} /><label>Yeni Katılımcı Sayısı</label><input type="number" placeholder="Sayı girin..." value={modularAepInput.katilimci} onChange={(e)=>setModularAepInput({...modularAepInput, katilimci: e.target.value})} /><div style={{display:"flex", gap:10, marginTop:25}}><button className="btn" style={{flex:1, background:C.border}} onClick={() => setShowModularAepModal(false)}>İptal</button><button className="btn btn-teal" style={{flex:2, background: C.rose, color: 'white'}} onClick={handleSaveModularAepData}>Kümilatif Kaydet</button></div></div></div>)}
                     {showDanismanlikModal && (<div className="modal-overlay"><div className="plan-modal" style={{borderColor: C.violet}}><h3 style={{marginTop:0, color:C.violet}}>📈 Danışmanlık Veri Girişi</h3><p style={{fontSize:12, color:C.textMuted, marginBottom:15}}>Her giriş mevcut toplamın üstüne eklenecektir.</p><label>Boşanma D. Sayısı</label><input type="number" placeholder="Sayı..." value={danismanlikInput.bosanma} onChange={(e)=>setDanismanlikInput({...danismanlikInput, bosanma: e.target.value})} /><label>Aile D. Sayısı</label><input type="number" placeholder="Sayı..." value={danismanlikInput.aile} onChange={(e)=>setDanismanlikInput({...danismanlikInput, aile: e.target.value})} /><label>Bireysel D. Sayısı</label><input type="number" placeholder="Sayı..." value={danismanlikInput.bireysel} onChange={(e)=>setDanismanlikInput({...danismanlikInput, bireysel: e.target.value})} /><label>Online Terapi Sayısı</label><input type="number" placeholder="Sayı..." value={danismanlikInput.online} onChange={(e)=>setDanismanlikInput({...danismanlikInput, online: e.target.value})} /><div style={{display:"flex", gap:10, marginTop:25}}><button className="btn" style={{flex:1, background:C.border}} onClick={() => setShowDanismanlikModal(false)}>İptal</button><button className="btn btn-violet" style={{flex:2}} onClick={handleSaveDanismanlikData}>Kümilatif Kaydet</button></div></div></div>)}
                     {showAepModal && (<div className="modal-overlay"><div className="plan-modal" style={{borderColor: C.teal}}><h3 style={{marginTop:0, color:C.teal}}>👨‍👩‍👧‍👦 AEP Veri Girişi</h3><p style={{fontSize:12, color:C.textMuted, marginBottom:15}}>Mevcut Toplam: {aepData.egitimToplam} Eğitim, {aepData.katilimciToplam} Katılımcı</p><label>Yeni Eğitim Sayısı</label><input type="number" placeholder="Sayı girin..." value={aepInput.egitim} onChange={(e)=>setAepInput({...aepInput, egitim: e.target.value})} /><label>Yeni Katılımcı Sayısı</label><input type="number" placeholder="Sayı girin..." value={aepInput.katilimci} onChange={(e)=>setAepInput({...aepInput, katilimci: e.target.value})} /><div style={{display:"flex", gap:10, marginTop:25}}><button className="btn" style={{flex:1, background:C.border}} onClick={() => setShowAepModal(false)}>İptal</button><button className="btn btn-teal" style={{flex:2}} onClick={handleSaveAepData}>Kümilatif Kaydet</button></div></div></div>)}
@@ -4201,7 +4455,7 @@ Belge başlığı, tarih, danışan bilgileri, klinik bulgular, değerlendirme v
                     {showPlanModal && (<div className="modal-overlay"><div className="plan-modal"><h3 style={{marginTop:0, color:C.accent}}>📅 Seans Planla</h3>{pendingPlanToAttach && (<div style={{background:`${C.teal}15`, border:`1px solid ${C.teal}40`, borderRadius:8, padding:"8px 12px", fontSize:12, color:C.teal, marginBottom:12}}>🎯 Oluşturduğunuz seans planı, seçtiğiniz tarih/saate otomatik olarak eklenecek.</div>)}{planStep === 1 ? (<div><p style={{fontSize:14, color:C.textMuted}}>Tarih seçin:</p><input type="date" onChange={(e) => {setPlannedDate(e.target.value); setPlanStep(2);}} style={{marginTop:10}} /></div>) : (<div><p style={{fontSize:14, color:C.textMuted}}>{plannedDate} için saat seçin:</p>{isOnlineClient(clients.find(c => c.id === selectedClientId)) && (<div style={{background:`${C.accent}12`, border:`1px solid ${C.accent}40`, borderRadius:10, padding:12, margin:"10px 0 4px"}}><div style={{fontSize:12, fontWeight:700, color:C.accent, marginBottom:8}}>💻 Online Terapi Görüşme Bilgisi</div><select value={planPlatform} onChange={(e)=>setPlanPlatform(e.target.value)}><option>Zoom</option><option>Google Meet</option><option>Microsoft Teams</option><option>WhatsApp Görüntülü</option><option>Telefon</option><option>Diğer</option></select><input placeholder="Görüşme bağlantısı (opsiyonel)" value={planLink} onChange={(e)=>setPlanLink(e.target.value)} style={{marginTop:8}} /></div>)}<div className="time-slot-grid">{["09:00", "10:00", "11:00", "14:00", "15:00", "16:00"].map(t => (<div key={t} className="time-slot" onClick={() => { setClients(clients.map(c => c.id === selectedClientId ? {...c, upcoming: {...(c.upcoming||{}), date: plannedDate, time: t, online: isOnlineClient(c), platform: isOnlineClient(c) ? planPlatform : null, link: isOnlineClient(c) ? planLink.trim() : null, plan: pendingPlanToAttach || c.upcoming?.plan || null}} : c)); setShowPlanModal(false); setPlanStep(1); setPendingPlanToAttach(null); setCustomPlanTime(""); setPlanLink(""); }}>{t}</div>))}</div><div style={{marginTop:18, paddingTop:15, borderTop:`1px solid ${C.border}`}}><p style={{fontSize:13, color:C.textMuted, margin:"0 0 8px"}}>veya istediğiniz saati girin:</p><div style={{display:"flex", gap:10}}><input type="time" step="60" value={customPlanTime} onChange={(e) => setCustomPlanTime(e.target.value)} style={{flex:1}} /><button className="btn btn-teal" style={{flex:1}} disabled={!customPlanTime} onClick={() => { if(!customPlanTime) return; setClients(clients.map(c => c.id === selectedClientId ? {...c, upcoming: {...(c.upcoming||{}), date: plannedDate, time: customPlanTime, online: isOnlineClient(c), platform: isOnlineClient(c) ? planPlatform : null, link: isOnlineClient(c) ? planLink.trim() : null, plan: pendingPlanToAttach || c.upcoming?.plan || null}} : c)); setShowPlanModal(false); setPlanStep(1); setPendingPlanToAttach(null); setCustomPlanTime(""); setPlanLink(""); }}>✅ Onayla</button></div><button className="btn" style={{marginTop:10, width:"100%", background:"transparent", color:C.textMuted, fontSize:12}} onClick={() => {setPlanStep(1); setCustomPlanTime("");}}>← Tarihi değiştir</button></div></div>)}<button className="btn" style={{marginTop:25, width:"100%", background:C.border}} onClick={() => {setShowPlanModal(false); setPendingPlanToAttach(null); setPlanStep(1); setCustomPlanTime(""); setPlanLink("");}}>İptal</button></div></div>)}
                     <div style={{position:"fixed", bottom:0, width:"100%", background:C.navBg, borderTop:`1px solid ${C.border}`, display:"flex", justifyContent:"center", gap:"30px", padding:"15px 0", zIndex:1000}}>
                         {[{id:"dashboard", i:"🏠", l:"Anasayfa"}, {id:"clients", i:"👥", l:"Danışanlar"}, {id:"trainings", i:"🎓", l:"Eğitimler"}, {id:"posts", i:"📝", l:"Yazılarım"}, {id:"kutuphane", i:"📚", l:"Kütüphanem"}, {id:"ai_assist", i:"🤖", l:"Yapay Zeka"}, {id:"data_records", i:"📊", l:"Veriler"}].map(t => (
-                            <div key={t.id} onClick={() => {setScreen(t.id); setSelectedClientId(null); setSelectedMaterialPage(null); setSelectedWritingCategory(null); setKutuphaneEkran(null);}} style={{textAlign:"center", cursor:"pointer", color: screen === t.id ? C.accent : C.textMuted, minWidth: "65px"}}><div style={{fontSize:22}}>{t.i}</div><div style={{fontSize:11, marginTop:4}}>{t.l}</div></div>
+                            <div key={t.id} onClick={() => {setScreen(t.id); setSelectedClientId(null); setSelectedMaterialPage(null); setSelectedWritingCategory(null); setKutuphaneEkran(null); setActiveDataCard(null);}} style={{textAlign:"center", cursor:"pointer", color: screen === t.id ? C.accent : C.textMuted, minWidth: "65px"}}><div style={{fontSize:22}}>{t.i}</div><div style={{fontSize:11, marginTop:4}}>{t.l}</div></div>
                         ))}
                     </div>
                 </div>
